@@ -2,3 +2,6 @@ node_modules/
 .env
 .DS_Store
 /src/generated/prisma
+
+
+rsync -avz --exclude 'node_modules' --exclude '.git' --exclude '.env' \-e "ssh -i ~/.ssh/LingomateEC2key.pem" \. ubuntu@ec2-16-184-11-218.ap-northeast-2.compute.amazonaws.com:~/app
