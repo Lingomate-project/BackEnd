@@ -12,11 +12,13 @@ import bodyParser from 'body-parser';
 import swaggerUi from 'swagger-ui-express';
 import swaggerJSDoc from 'swagger-jsdoc';
 
-// 3. 라우터 및 서비스 수입 (★ 충돌 해결: 둘 다 남김 ★)
+// 3. 라우터 및 서비스 수입
 import authRoutes from './routes/auth.routes.js';
 import convRoutes from './routes/convRoutes.js';
-import model from './lib/gemini.js'; // (너의 Gemini)
-import apiRoutes from './routes/apiRoutes.js';
+import apiRoutes from './routes/apiRoutes.js'; // (조원 라우터)
+import model from './lib/gemini.js'; // (Gemini AI)
+import { transcribeAudio } from './lib/googleSpeech.js'; // (STT)
+import { synthesizeSpeech } from './lib/googleTTS.js'; // ★ (NEW) TTS 통역사 추가 ★
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -43,9 +45,6 @@ app.use(bodyParser.json());
 app.get("/", (req, res) => res.send("Hello from Docker!")); 
 app.use('/auth', authRoutes); 
 app.use('/api/conversations', checkJwt, convRoutes);
-
-// (조원이 추가한 apiRoutes도 등록해줘야 함 - 보통 /api 경로를 씀)
-// 만약 조원이 아래쪽에 app.use 코드를 안 짰다면 이 줄이 필요해:
 app.use('/api', apiRoutes); 
 
 // Swagger 설정
@@ -80,19 +79,57 @@ const wss = new WebSocketServer({ server });
 wss.on('connection', (ws) => {
   console.log('[WebSocket] 클라이언트가 연결되었습니다.');
 
-  ws.on('message', async (message) => {
+  // ★ 메시지 수신 (텍스트 or 음성) ★
+  ws.on('message', async (data, isBinary) => {
     try {
-      const userPrompt = message.toString();
-      console.log(`[WebSocket] 메시지 수신: ${userPrompt}`);
+      let userPrompt = '';
+
+      if (isBinary) {
+        // 1. 음성 데이터(Binary)가 온 경우 -> STT로 변환
+        console.log('[WebSocket] 음성 데이터 수신 (Binary)');
+        try {
+          userPrompt = await transcribeAudio(data); // 구글 STT 호출
+          console.log(`[STT] 변환된 텍스트: "${userPrompt}"`);
+          
+          if (!userPrompt || userPrompt.trim().length === 0) {
+            ws.send('음성을 인식하지 못했습니다.');
+            return;
+          }
+        } catch (sttError) {
+          console.error('[STT] 에러:', sttError);
+          ws.send('음성 인식(STT) 중 오류가 발생했습니다.');
+          return;
+        }
+      } else {
+        // 2. 텍스트 데이터가 온 경우 -> 그대로 사용
+        userPrompt = data.toString();
+        console.log(`[WebSocket] 텍스트 메시지 수신: "${userPrompt}"`);
+      }
       
-      // --- Gemini API 호출 ---
+      // --- 3. Gemini AI 호출 (공통) ---
       const result = await model.generateContent(userPrompt);
       const response = result.response;
       const aiText = response.text();
-      // ---------------------
+      // -----------------------------
 
       console.log(`[Gemini] 응답: ${aiText}`);
+      
+      // 4. [텍스트 전송] 프론트로 텍스트 답변 먼저 전송
       ws.send(aiText); 
+
+      // 5. [오디오 전송] (NEW) TTS로 변환해서 오디오 전송!
+      try {
+        console.log('[TTS] 오디오 변환 시작...');
+        const audioContent = await synthesizeSpeech(aiText); // 구글 TTS 호출
+        console.log(`[TTS] 변환 완료! (${audioContent.length} bytes)`);
+        
+        // 오디오 데이터 전송 (바이너리)
+        ws.send(audioContent); 
+        
+      } catch (ttsError) {
+        console.error('[TTS] 에러:', ttsError);
+        // TTS 실패해도 텍스트는 이미 갔으니까 에러 메시지는 생략하거나 로그만 남김
+      }
       
     } catch (error) {
       console.error('[Gemini] 에러:', error);
@@ -112,7 +149,7 @@ wss.on('connection', (ws) => {
 
 // --- 9. 서버 실행 ---
 server.listen(PORT, () => {
-  console.log(`[V5] HTTP + WebSocket + Gemini 서버가 ${PORT}에서 실행 중입니다!`);
+  console.log(`[V7] STT + Gemini + TTS 서버가 ${PORT}에서 실행 중입니다!`);
   console.log("AUTH0_DOMAIN (for check):", process.env.AUTH0_DOMAIN);
   console.log(`Swagger Docs: http://localhost:${PORT}/api-docs`);
 });
