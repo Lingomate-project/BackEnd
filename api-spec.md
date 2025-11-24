@@ -260,9 +260,10 @@ conversation_scripts
 ### 4.1 음성 -> 텍스트 (STT 결과)
 
 요청
-{
-  "audioUrl": "https://s3.amazonaws.com/lingomate/audio_123.wav"
-}
+﻿{ 
+ "audio": "audio/wav" 
+ }
+
 
 응답
 {
