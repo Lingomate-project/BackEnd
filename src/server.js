@@ -11,14 +11,20 @@ import { auth } from 'express-oauth2-jwt-bearer';
 import bodyParser from 'body-parser'; 
 import swaggerUi from 'swagger-ui-express';
 import swaggerJSDoc from 'swagger-jsdoc';
+import url from 'url'; // URL 파싱용
+
+// Auth0 검문 도구들
+import jwt from 'jsonwebtoken';
+import jwksClient from 'jwks-rsa';
 
 // 3. 라우터 및 서비스 수입
 import authRoutes from './routes/auth.routes.js';
 import convRoutes from './routes/convRoutes.js';
-import apiRoutes from './routes/apiRoutes.js'; // (조원 라우터)
-import model from './lib/gemini.js'; // (Gemini AI)
-import { transcribeAudio } from './lib/googleSpeech.js'; // (STT)
-import { synthesizeSpeech } from './lib/googleTTS.js'; // ★ (NEW) TTS 통역사 추가 ★
+import apiRoutes from './routes/apiRoutes.js'; 
+import model from './lib/gemini.js'; 
+import { transcribeAudio } from './lib/googleSpeech.js'; 
+import { synthesizeSpeech } from './lib/googleTTS.js'; 
+import prisma from './lib/prisma.js'; 
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -31,7 +37,20 @@ if (!auth0Domain || !auth0Audience) {
   throw new Error('AUTH0_DOMAIN 또는 AUTH0_AUDIENCE가 .env 파일에 없습니다!');
 }
 
-// 5. 경비원 설정
+// WebSocket용 Auth0 검증 클라이언트 설정
+const client = jwksClient({
+  jwksUri: `https://${auth0Domain}/.well-known/jwks.json`
+});
+
+// 헬퍼 함수: 키 찾기
+function getKey(header, callback) {
+  client.getSigningKey(header.kid, function(err, key) {
+    const signingKey = key.publicKey || key.rsaPublicKey;
+    callback(null, signingKey);
+  });
+}
+
+// 5. HTTP API 경비원 설정 (기존)
 const checkJwt = auth({
   issuerBaseURL: `https://${auth0Domain}`, 
   audience: auth0Audience,               
@@ -42,7 +61,7 @@ app.use(express.json());
 app.use(bodyParser.json());
 
 // 7. 라우터 등록
-app.get("/", (req, res) => res.send("Hello from Docker!")); 
+app.get("/", (req, res) => res.send("Hello from LingoMate Server!")); 
 app.use('/auth', authRoutes); 
 app.use('/api/conversations', checkJwt, convRoutes);
 app.use('/api', apiRoutes); 
@@ -51,11 +70,7 @@ app.use('/api', apiRoutes);
 const options = {
   definition: {
     openapi: '3.0.0',
-    info: {
-      title: 'LingoMate API 문서',
-      version: '1.0.0',
-      description: '백엔드 Auth 관련 API 명세서입니다.',
-    },
+    info: { title: 'LingoMate API', version: '1.0.0' },
     servers: [{ url: `http://localhost:${PORT}` }],
   },
   apis: ['./src/routes/*.js'], 
@@ -63,93 +78,186 @@ const options = {
 const specs = swaggerJSDoc(options);
 app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(specs)); 
 
-// 보호된 라우트 테스트
-app.get('/api/protected', checkJwt, (req, res) => {
-  res.json({
-    message: '축하합니다! "출입증"이 확인됐습니다!',
-    authInfo: req.auth 
-  });
-});
-
-
 // --- 8. WebSocket 서버 설정 ---
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-wss.on('connection', (ws) => {
-  console.log('[WebSocket] 클라이언트가 연결되었습니다.');
+wss.on('connection', async (ws, req) => {
+  console.log('🔵 Client attempting to connect...');
 
-  // ★ 메시지 수신 (텍스트 or 음성) ★
+  // --- [Auth0] 토큰 검사 및 유저 판별 ---
+  let currentUserId = 1; 
+  let currentUser = null;
+
+  try {
+    const parameters = url.parse(req.url, true);
+    const token = parameters.query.token;
+
+    if (token) {
+      console.log('🔒 Token detected. Verifying...');
+      const decoded = await new Promise((resolve, reject) => {
+        jwt.verify(token, getKey, { algorithms: ['RS256'] }, (err, decoded) => {
+          if (err) return reject(err);
+          resolve(decoded);
+        });
+      });
+
+      const auth0Sub = decoded.sub;
+      const realUser = await prisma.user.findUnique({ where: { auth0Sub: auth0Sub } });
+
+      if (realUser) {
+        currentUserId = realUser.id;
+        currentUser = realUser;
+        console.log(`✅ Auth0 Login Success! User: ${realUser.username} (ID: ${realUser.id})`);
+      } else {
+        console.log(`⚠️ Token valid, but user not found in DB. (Sub: ${auth0Sub})`);
+      }
+    } else {
+      console.log('⚠️ No token provided. Fallback to Test User (ID: 1).');
+    }
+  } catch (err) {
+    console.error('❌ Token Verification Failed:', err.message);
+  }
+
+  // 유저가 없으면 테스트 유저(ID 1) 강제 할당
+  if (!currentUser) {
+      try {
+          currentUser = await prisma.user.findUnique({ where: { id: 1 } });
+          if (!currentUser) {
+            currentUser = await prisma.user.create({
+                data: {
+                    auth0Sub: "test-auth0-id-123", 
+                    username: "TestUser",
+                    email: "test@lingomate.com",
+                    countryPref: "United States",
+                    stylePref: "Casual",
+                    genderPref: "Female"
+                }
+            });
+            console.log('🔨 Test User Created.');
+          }
+          currentUserId = currentUser.id;
+      } catch (e) {
+          console.error("❌ DB Error:", e);
+      }
+  }
+
+  let conversationId = null; 
+
   ws.on('message', async (data, isBinary) => {
     try {
       let userPrompt = '';
 
+      // 1. STT 처리
       if (isBinary) {
-        // 1. 음성 데이터(Binary)가 온 경우 -> STT로 변환
-        console.log('[WebSocket] 음성 데이터 수신 (Binary)');
         try {
-          userPrompt = await transcribeAudio(data); // 구글 STT 호출
-          console.log(`[STT] 변환된 텍스트: "${userPrompt}"`);
-          
-          if (!userPrompt || userPrompt.trim().length === 0) {
-            ws.send('음성을 인식하지 못했습니다.');
-            return;
+          userPrompt = await transcribeAudio(data); 
+          console.log(`[STT] Result: "${userPrompt}"`);
+          if (!userPrompt?.trim()) {
+             ws.send(JSON.stringify({ type: 'error', message: 'No speech detected' }));
+             return;
           }
         } catch (sttError) {
-          console.error('[STT] 에러:', sttError);
-          ws.send('음성 인식(STT) 중 오류가 발생했습니다.');
+          console.error('[STT] Error:', sttError);
           return;
         }
       } else {
-        // 2. 텍스트 데이터가 온 경우 -> 그대로 사용
         userPrompt = data.toString();
-        console.log(`[WebSocket] 텍스트 메시지 수신: "${userPrompt}"`);
+        console.log(`📩 Text received: "${userPrompt}"`);
       }
       
-      // --- 3. Gemini AI 호출 (공통) ---
-      const result = await model.generateContent(userPrompt);
-      const response = result.response;
-      const aiText = response.text();
-      // -----------------------------
+      // 2. DB 저장 (유저 메시지) & 대화방 확보
+      try {
+        if (!conversationId) {
+            const newConv = await prisma.conversation.create({
+                data: {
+                    userId: currentUserId,
+                    countryUsed: currentUser.countryPref || "United States",
+                    styleUsed: currentUser.stylePref || "Casual",
+                    genderUsed: currentUser.genderPref || "Female"
+                }
+            });
+            conversationId = newConv.id;
+            console.log(`🆕 New Conversation: ID ${conversationId}`);
+        }
 
-      console.log(`[Gemini] 응답: ${aiText}`);
-      
-      // 4. [텍스트 전송] 프론트로 텍스트 답변 먼저 전송
+        await prisma.message.create({
+            data: {
+                conversationId: conversationId,
+                sender: 'USER', 
+                content: userPrompt
+            }
+        });
+      } catch (dbErr) {
+        console.error('❌ DB Save Error (User):', dbErr);
+      }
+
+      // ★ [핵심 변경 V10] AI에게 기억력(History) 주입하기 ★
+      let aiText = "";
+      try {
+          // (1) DB에서 최근 대화 10개 가져오기
+          const historyData = await prisma.message.findMany({
+              where: { conversationId: conversationId },
+              take: 10, // 최근 10개만 기억
+              orderBy: { id: 'desc' } // 최신순으로 가져와서
+          });
+
+          // (2) Gemini 포맷으로 변환 (과거 -> 현재 순서로 뒤집기)
+          // Gemini Role: 'user' = 사용자, 'model' = AI
+          const historyForGemini = historyData.reverse().map(msg => ({
+              role: msg.sender === 'USER' ? 'user' : 'model',
+              parts: [{ text: msg.content }]
+          }));
+
+          // (3) 대화 모드(Chat) 시작 (기억력 탑재)
+          const chat = model.startChat({
+              history: historyForGemini,
+          });
+
+          // (4) 메시지 전송
+          const result = await chat.sendMessage(userPrompt);
+          aiText = result.response.text();
+          console.log(`🤖 AI (with Memory): ${aiText}`);
+
+      } catch (aiError) {
+          console.error("Gemini Error:", aiError);
+          aiText = "Sorry, I am having trouble thinking right now.";
+      }
+
+      // 3. 텍스트 전송
       ws.send(aiText); 
 
-      // 5. [오디오 전송] (NEW) TTS로 변환해서 오디오 전송!
+      // 4. DB 저장 (AI 답변)
+      if (conversationId) {
+          await prisma.message.create({
+              data: {
+                  conversationId: conversationId,
+                  sender: 'AI',
+                  content: aiText
+              }
+          });
+      }
+
+      // 5. TTS 전송
       try {
-        console.log('[TTS] 오디오 변환 시작...');
-        const audioContent = await synthesizeSpeech(aiText); // 구글 TTS 호출
-        console.log(`[TTS] 변환 완료! (${audioContent.length} bytes)`);
-        
-        // 오디오 데이터 전송 (바이너리)
+        const audioContent = await synthesizeSpeech(aiText); 
         ws.send(audioContent); 
-        
       } catch (ttsError) {
-        console.error('[TTS] 에러:', ttsError);
-        // TTS 실패해도 텍스트는 이미 갔으니까 에러 메시지는 생략하거나 로그만 남김
+        console.error('[TTS] Error:', ttsError);
       }
       
     } catch (error) {
-      console.error('[Gemini] 에러:', error);
-      ws.send('AI 응답 생성에 실패했습니다.');
+      console.error('[Server] Error:', error);
+      ws.send('Server Error');
     }
   });
 
   ws.on('close', () => {
-    console.log('[WebSocket] 클라이언트 연결이 끊겼습니다.');
-  });
-
-  ws.on('error', (error) => {
-    console.error('[WebSocket] 에러 발생:', error);
+    console.log('🔴 Client disconnected');
   });
 });
 
-
-// --- 9. 서버 실행 ---
+// --- 서버 실행 ---
 server.listen(PORT, () => {
-  console.log(`[V7] STT + Gemini + TTS 서버가 ${PORT}에서 실행 중입니다!`);
-  console.log("AUTH0_DOMAIN (for check):", process.env.AUTH0_DOMAIN);
-  console.log(`Swagger Docs: http://localhost:${PORT}/api-docs`);
+  console.log(`[V10] Auth0 + DB + Memory(Context) Server running on ${PORT}`);
 });
