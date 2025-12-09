@@ -6,19 +6,31 @@ export default () => {
 
     // GET /api/auth/me
     controller.getMe = async (req, res) => {
+
+        console.log("==== AUTH HEADER ====");
+        console.log(req.headers.authorization);
+
+        console.log("==== AUTH PAYLOAD ====");
+        console.log(req.auth?.payload);
+
         const auth0Sub = req.auth?.payload?.sub;
+        const { name, nickname, email, picture } = req.auth?.payload || {};
 
         try {
-            const user = await prisma.user.findUnique({
-                where: { auth0Sub },    // <── YOUR REAL PRISMA FIELD
+            // 존재하지 않으면 자동 생성하여 404를 방지
+            const user = await prisma.user.upsert({
+                where: { auth0Sub },
+                update: {},
+                create: {
+                    auth0Sub,
+                    username: name || nickname || "User",
+                    email,
+                    avatarUrl: picture,
+                    stats: { create: { totalSentences: 0, studyStreak: 0 } },
+                    subscription: { create: { planName: "free", isActive: true } }
+                },
                 include: { subscription: true }
             });
-
-            if (!user) {
-                return res.status(404).json(
-                    errorResponse("AUTH_404", "User not registered in DB", 404)
-                );
-            }
 
             res.json(successResponse({
                 auth0Id: auth0Sub,

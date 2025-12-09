@@ -1,3 +1,4 @@
+// apiRoutes.js
 import express from 'express';
 import { auth as checkJwtMiddleware } from 'express-oauth2-jwt-bearer';
 
@@ -7,23 +8,18 @@ import conversationController from '../controllers/convController.js';
 import aiController from '../controllers/aiController.js';
 import subscriptionController from '../controllers/subscriptionController.js';
 import statsController from '../controllers/statsController.js';
+import homeController from '../controllers/homeController.js';
 
-const router = express.Router();
+export default function apiRoutes(checkJwt, wss) {
+  const router = express.Router();
 
-const checkJwt = checkJwtMiddleware({
-  audience: process.env.AUTH0_AUDIENCE,
-  issuerBaseURL: `https://${process.env.AUTH0_DOMAIN}/`,
-  tokenSigningAlg: "RS256",
-});
-
-// Inject WebSocket
-export default (wss) => {
   const auth = authController();
   const user = userController();
   const conv = conversationController(wss);
   const ai = aiController();
   const sub = subscriptionController();
   const stats = statsController();
+  const home = homeController();
 
   // ==================== AUTH ROUTES ====================
   router.get('/auth/me', checkJwt, auth.getMe);
@@ -74,6 +70,9 @@ export default (wss) => {
   router.put('/notifications/settings', checkJwt, (req, res) =>
     res.json({ success: true, data: req.body })
   );
+
+  // ==================== HOME ====================
+  router.get('/home/status', checkJwt, home.getHomeStatus);
 
   return router;
 };

@@ -17,6 +17,9 @@ import apiRoutes from "./routes/apiRoutes.js";
 
 const app = express();
 const PORT = process.env.PORT || 8080;
+const PUBLIC_BASE_URL =
+  process.env.PUBLIC_BASE_URL ||
+  "http://lingomate-backend.ap-northeast-2.elasticbeanstalk.com";
 
 // -------------------------------------------------------------
 // 1. ENVIRONMENT CHECKS
@@ -70,7 +73,10 @@ const swaggerSpec = swaggerJSDoc({
       version: "2.1.0",
       description: "Backend API Documentation for LingoMate App",
     },
-    servers: [{ url: `http://localhost:${PORT}` }],
+    servers: [
+      { url: PUBLIC_BASE_URL },
+      { url: `http://localhost:${PORT}` },
+    ],
     components: {
       securitySchemes: {
         bearerAuth: {
@@ -175,5 +181,5 @@ app.use("/api", apiRoutes(checkJwt, wss));
 // -------------------------------------------------------------
 server.listen(PORT, () => {
   console.log(`[SERVER] Running on port ${PORT}`);
-  console.log(`[DOCS] http://localhost:${PORT}/api-docs`);
+  console.log(`[DOCS] ${PUBLIC_BASE_URL}/api-docs`);
 });
