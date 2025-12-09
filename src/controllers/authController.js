@@ -7,12 +7,6 @@ export default () => {
     // GET /api/auth/me
     controller.getMe = async (req, res) => {
 
-        console.log("==== AUTH HEADER ====");
-        console.log(req.headers.authorization);
-
-        console.log("==== AUTH PAYLOAD ====");
-        console.log(req.auth?.payload);
-
         const auth0Sub = req.auth?.payload?.sub;
         const { name, nickname, email, picture } = req.auth?.payload || {};
 
